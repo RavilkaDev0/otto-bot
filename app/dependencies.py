@@ -26,7 +26,7 @@ from app.services.product_service import ProductService
 from app.services.extermal_service import ExternalService
 from app.clients.external_otto_client import ExternalOttoClient
 from app.repository.external_api_repository import ExternalApiRepository
-from app.infrastructure.rabbitmq import RabbitMQPublisher
+from app.infrastructure.rabbitmq_publisher import RabbitMQPublisher
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/v1/auth/login")
 

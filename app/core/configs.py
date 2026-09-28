@@ -119,11 +119,11 @@ class Settings(BaseSettings):
             productSafety=ProductSafety(
                 addresses=[
                     Address(
-                        name="DEFAULT",
-                        address="DEFAUL",
+                        name="XL MOEBEL GmbH",
+                        address="Am Flugplatz 26, 88483 Burgrieden",
                         email="info@xlmoebel.de",
-                        phone="07392 - 93 78 44 0",
-                        url=HttpUrl("https://www.xlmoebel.de/Infos/Kontakt.htm"),
+                        phone="07392 - 93 78 188",
+                        url=HttpUrl("https://www.xlmoebel.de/kontakt"),
                     )
                 ]
             )

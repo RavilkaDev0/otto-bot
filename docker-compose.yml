@@ -63,6 +63,19 @@ services:
       timeout: 5s
       retries: 5
 
+  rabbitmq-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: otto-bit-rabbitmq-worker
+    command: ["python", "-m", "app.infrastructure.rabbitmq_worker"]
+    env_file:
+      - docker.env
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
   backend:
     build:
       context: .

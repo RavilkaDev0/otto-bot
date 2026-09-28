@@ -1,16 +1,46 @@
+import asyncio
 import hashlib
-from copy import deepcopy
-from typing import Any
+import logging
 from uuid import UUID
+from typing import Any
+from copy import deepcopy
+from httpx import HTTPStatusError
+from pydantic import ValidationError
+from datetime import datetime, timezone
+
+from app.core.otto_exceptions import OttoApiException, OttoNotFoundError
+
+from sqlalchemy import or_, select, update
+from sqlalchemy.orm import selectinload
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.products import Product
+from app.models.product_variants import ProductVariant
+from app.models.otto_xlsx_import import OttoXlsxImportRow
+
 
 from app.clients.external_otto_client import ExternalOttoClient
+from app.core.logger import format_log_payload
+
 from app.infrastructure.rabbitmq_publisher import RabbitMQPublisher
+
 from app.models.attribute_allowed_values import AttributeAllowedValue
 from app.models.attributes import Attribute
 from app.models.categories import Category
 from app.models.category_group import CategoryGroup
+
+from app.repository.external_api_repository import ExternalApiRepository
+
+from app.schemas.product_response import (
+    ExternalCategoryAttributesResponse,
+    ExternalCategoriesResponse,
+    ExternalCategoryItem,
+    OttoCategoryResponse,
+    AttributeSchema,
+)
 from app.schemas.external_schemes.until_schemes import (
     CreateOrUpdateProductVariationRequest,
+    ProductVariationRequest,
     ActiveStatusByEanResponse,
     ActiveStatusByEanRequest,
     DeliveryInformationRequest,
@@ -23,20 +53,9 @@ from app.schemas.external_schemes.until_schemes import (
     QuantityRequest,
     Controller,
     Quantity,
+    UpdateTaskResponse,
 )
-from app.schemas.product_response import (
-    ExternalCategoryAttributesResponse,
-    ExternalCategoriesResponse,
-    ExternalCategoryItem,
-    OttoCategoryResponse,
-    AttributeSchema,
-)
-from app.repository.external_api_repository import ExternalApiRepository
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
-import logging
 
 logger = logging.getLogger("external_api")
 
@@ -67,13 +86,13 @@ EXTERNAL_PRODUCT_COMPLIANCE_BY_CONTROLLER: dict[str, dict[str, Any]] = {
         "productSafety": {
             "addresses": [
                 {
-                    "name": "DEFAULT",
-                    "address": "DEFAUL",
+                    "name": "XL MOEBEL GmbH",
+                    "address": "Am Flugplatz 26, 88483 Burgrieden",
                     "regionCode": "DE",
                     "roles": ["DISTRIBUTOR"],
                     "email": "info@xlmoebel.de",
-                    "phone": "07392 - 93 78 44 0",
-                    "url": "https://www.xlmoebel.de/Infos/Kontakt.htm",
+                    "phone": "07392 - 93 78 188",
+                    "url": "https://www.xlmoebel.de/kontakt",
                     "components": [],
                 }
             ]
@@ -100,103 +119,138 @@ class ExternalService:
         self.client = client
 
     async def get_products(self, payload: GetProductRequest, controller: str):
-        logger.info("Клиент принял запрос")
-        
+        logger.info(
+            "Service accepted get_products request\npayload:\n%s",
+            format_log_payload(payload),
+        )
+
         data = await self.client.get_products(payload, controller)
+        
+        if payload.sku is None:
+            return data
+        logger.info(f"Sending request to get_shipping_profile_for_product")
+        try: 
+            data2 = await self.client.get_shipping_profile_for_product(payload.sku, controller)
 
-        logger.info(f"Успешно выполнен запрос. Ответ: {data}")
+        except Exception:
+            data2 = None
 
-        return data
+        if isinstance(data2, dict) and data2.get("shippingProfileId", None):
+            shipping_profile_id = data2["shippingProfileId"]
+            
+            logger.info(
+                "OTTO get_products response:\n%s\n and shipping_profile_id:%s",
+                format_log_payload(data),
+                shipping_profile_id
+            )
+            
+            response = {**data, "shipping_profile_id": shipping_profile_id}
 
+            return response
+            
+        return {**data, "shipping_profile_id": data2}
+            
     async def create_or_update_product(
-        self, 
-        payload: CreateOrUpdateProductVariationRequest, 
+        self,
+        payload: CreateOrUpdateProductVariationRequest,
         controller: Controller,
-        publisher: RabbitMQPublisher
+        publisher: RabbitMQPublisher | None = None,
     ):
-        logger.info("Клиент принял запрос")
-        
-        variation = payload.root[0]
+        logger.info(
+            "Service accepted create_or_update_product request\npayload:\n%s",
+            format_log_payload(payload),
+        )
 
-        logger.info("Создание или обновление товара в OTTO: sku=%s", variation.sku)
-        
+        skus = [v.sku for v in payload.root]
+        logger.info("Создание или обновление товаров в OTTO: skus=%s", skus)
+
         prepared_payload = self._prepare_create_or_update_payload(payload, controller)
-        
-        logger.debug("Prepared OTTO payload: %s", prepared_payload)
-        
+
+        logger.debug("Prepared OTTO payload:\n%s", format_log_payload(prepared_payload))
+
         try:
             response = await self.client.create_or_update_product(prepared_payload, controller)
         except Exception:
-            logger.exception("Ошибка создания или обновления товара: sku=%s", variation.sku)
+            logger.exception("Ошибка создания или обновления товаров: skus=%s", skus)
             raise
-        
+
         marketplace_job_id = self._extract_marketplace_job_id(response)
-        
-        if marketplace_job_id is None:
-            logger.error(
-                "OTTO не вернул marketplace_job_id: sku=%s response=%s",
-                variation.sku,
-                response,
-            )
-            raise RuntimeError("OTTO response does not contain marketplace_job_id")
 
         job = self._build_delivery_job(
-            marketplace_job_id,
-            variation.shipping_profile_id,
-            variation.sku,
-            controller=controller
+            marketplace_job_id=marketplace_job_id,
+            variations=payload.root,
+            controller=controller,
         )
 
-        try:
-            await publisher.publish(job)
-        except Exception:
-            logger.exception(
-                "Товар отправлен в OTTO, но задача не опубликована: "
-                "marketplace_job_id=%s sku=%s",
+        if publisher is not None:
+            try:
+                await publisher.publish(job)
+            except Exception:
+                logger.exception(
+                    "Товары отправлены в OTTO, но задача не опубликована: "
+                    "marketplace_job_id=%s skus=%s",
+                    marketplace_job_id,
+                    skus,
+                )
+                raise
+
+            logger.info(
+                "Задача опубликована: task_id=%s marketplace_job_id=%s skus=%s",
+                job.task_id,
                 marketplace_job_id,
-                variation.sku,
+                skus,
             )
-            raise
-        
-        logger.info(
-            "Задача опубликована: task_id=%s marketplace_job_id=%s sku=%s",
-            job.task_id,
-            marketplace_job_id,
-            variation.sku,
-        )
-        
-        return response
-    
+        else:
+            logger.warning(
+                "RabbitMQ publisher не передан, availability не поставлен в очередь: "
+                "marketplace_job_id=%s skus=%s",
+                marketplace_job_id,
+                skus,
+            )
+
+        return {
+            "status": "accepted",
+            "marketplace_job_id": str(marketplace_job_id),
+            "task_id": str(job.task_id),
+            "skus": skus,
+            "raw_response": response,
+        }
+
     def _build_delivery_job(
         self,
         marketplace_job_id: UUID,
-        shipping_profile_id: str,
-        sku: str,
-        controller: Controller
+        variations: list[ProductVariationRequest],
+        controller: Controller,
     ) -> CreateDeliveryJob:
-        delivery = DeliveryInformation(
-            shipping_profile_id=shipping_profile_id,
-            sku=sku
-        )
-        quantity = Quantity(
-            quantity=20,
-            sku=sku
-        )
-        
-        quantity_data = QuantityRequest.model_validate(quantity)
-        delivery_data = DeliveryInformationRequest.model_validate(delivery)
-        
+        delivery_list = [
+            DeliveryInformation(
+                shipping_profile_id=var.shipping_profile_id,
+                sku=var.sku,
+            )
+            for var in variations
+        ]
+        quantity_list = [
+            Quantity(
+                quantity=var.quantity,
+                sku=var.sku,
+            )
+            for var in variations
+        ]
+
+        quantity_data = QuantityRequest.model_validate(quantity_list)
+        delivery_data = DeliveryInformationRequest.model_validate(delivery_list)
+
         availability_data = AvailabilityRequest(
-            quantities=quantity_data, 
-            delivery_information=delivery_data
+            quantities=quantity_data,
+            delivery_information=delivery_data,
         )
-    
+
         job = CreateDeliveryJob(
             marketplace_job_id=marketplace_job_id,
             availability_data=availability_data,
-            controller=controller
+            controller=controller,
         )
-        
+
         return job
 
     def _prepare_create_or_update_payload(
@@ -220,20 +274,58 @@ class ExternalService:
             self._apply_msrp(product)
 
         return products
-    
-    
+
+
     def _extract_marketplace_job_id(self, payload: dict[str, Any]) -> UUID:
-        href: str = payload["links"][0]["href"]
-        task_id = UUID(href.rstrip("/").rsplit("/", 1)[-1])
-        
-        return task_id
-    
-    
+        links = payload.get("links")
+        if not links or not isinstance(links, list):
+            logger.error("OTTO не вернул links: response=\n%s", format_log_payload(payload))
+            raise RuntimeError(f"OTTO response does not contain valid 'links': {payload}")
+
+        href = links[0].get("href")
+        if not href or not isinstance(href, str):
+            logger.error("OTTO link missing href: response=\n%s", format_log_payload(payload))
+            raise RuntimeError(f"OTTO link missing 'href': {payload}")
+
+        job_id_str = href.rstrip("/").rsplit("/", 1)[-1]
+        try:
+            return UUID(job_id_str)
+        except ValueError as exc:
+            raise RuntimeError(f"Failed to parse UUID from OTTO href '{href}': {exc}") from exc
+
+
     async def create_or_update_availability(self, job: CreateDeliveryJob) -> None:
+        update_status = await self._wait_for_update_task(
+            job.marketplace_job_id,
+            job.controller,
+        )
+
+        has_success_or_unchanged = (update_status.succeeded + update_status.unchanged) > 0
+        if not has_success_or_unchanged:
+            logger.warning(
+                "Availability не запущен: OTTO update-task не succeeded/unchanged: "
+                "job_id=%s succeeded=%s unchanged=%s failed=%s state=%s message=%s",
+                job.marketplace_job_id,
+                update_status.succeeded,
+                update_status.unchanged,
+                update_status.failed,
+                update_status.state,
+                update_status.message,
+            )
+            return
+
+        logger.info(
+            "OTTO product update завершен, запускаю availability: job_id=%s succeeded=%s unchanged=%s failed=%s",
+            job.marketplace_job_id,
+            update_status.succeeded,
+            update_status.unchanged,
+            update_status.failed,
+        )
+
         availability_data = job.availability_data
-        
+
         controller = job.controller
-        
+
         quantity_data = availability_data.quantities
         delivery_information_data = availability_data.delivery_information
         try:
@@ -246,16 +338,92 @@ class ExternalService:
                 "Ошибка в оркестраторе запроса"
             )
             raise
-            
+
         logger.info(
             "Успешно обработал оркестратор запросов: method=%s marketplace_job_id=%s",
             "create_or_update_availability",
             job.marketplace_job_id
         )
         logger.info(
-            "Ответы от оркестратора: quantity=%s delivery=%s",
-            quantity_result,
-            delivery_information_result
+            "Ответы от оркестратора:\nquantity:\n%s\ndelivery:\n%s",
+            format_log_payload(quantity_result),
+            format_log_payload(delivery_information_result),
+        )
+
+
+    async def read_update_task_result(self, job_id: UUID, controller) -> UpdateTaskResponse:
+        response = await self.client.read_update_task_result(job_id, controller)
+
+        try:
+            data = UpdateTaskResponse.model_validate(response)
+
+        except ValidationError:
+            logger.exception(
+                "Произошла ошибка валидации. function=%s\n job_id=%s",
+                "read_update_task_result",
+                job_id
+            )
+            raise
+
+        return data
+
+
+    async def _wait_for_update_task(
+        self,
+        job_id: UUID,
+        controller: str,
+        max_attempts: int = 120,
+        interval_seconds: float = 3.0,
+    ) -> UpdateTaskResponse:
+        for attempt in range(1, max_attempts + 1):
+            logger.info("Ожидается статус задачи из OTTO (попытка %d/%d)...", attempt, max_attempts)
+            try:
+                update_status = await self.read_update_task_result(job_id, controller)
+            except OttoNotFoundError:
+                if attempt <= 5:
+                    logger.warning(
+                        "Update task %s еще не найдена в OTTO (попытка %d/%d), повтор через %.1fs...",
+                        job_id, attempt, max_attempts, interval_seconds,
+                    )
+                    await asyncio.sleep(interval_seconds)
+                    continue
+                raise
+
+            if update_status.state == "done":
+                logger.info(
+                    "Статус задачи получен: job_id=%s attempt=%d",
+                    job_id,
+                    attempt,
+                )
+                return update_status
+
+            if update_status.state in ("failed", "error", "cancelled"):
+                logger.error(
+                    "Задача OTTO завершилась со статусом %s: job_id=%s message=%s",
+                    update_status.state,
+                    job_id,
+                    update_status.message,
+                )
+                return update_status
+
+            delay = interval_seconds
+            if update_status.ping_after is not None:
+                now = datetime.now(timezone.utc)
+                if update_status.ping_after > now:
+                    delay = max((update_status.ping_after - now).total_seconds(), 1.0)
+                    delay = min(delay, 30.0)
+
+            logger.info(
+                "Задача все еще %s, retry: job_id=%s sleep_seconds=%.2f",
+                update_status.state,
+                job_id,
+                delay,
+            )
+
+            await asyncio.sleep(delay)
+
+        raise TimeoutError(
+            f"OTTO update-task {job_id} did not finish within {max_attempts * interval_seconds:.0f}s"
         )
 
 
@@ -279,18 +447,81 @@ class ExternalService:
             "currency": standard_price.get("currency") or "EUR",
         }
 
+    async def resolve_sku_for_ean(
+        self,
+        ean: str,
+        controller: str,
+        session: AsyncSession | None = None,
+    ) -> str | None:
+        """Find SKU corresponding to EAN via local database or OTTO API."""
+        # 1. Search in local database (first OttoXlsxImportRow filtered by account, then Product)
+        if session is not None:
+            try:
+                stmt_import = select(OttoXlsxImportRow.sku).where(
+                    OttoXlsxImportRow.account == controller.lower(),
+                    OttoXlsxImportRow.ean == ean,
+                    OttoXlsxImportRow.sku.isnot(None),
+                ).limit(1)
+                sku_row = (await session.execute(stmt_import)).scalar_one_or_none()
+                if sku_row and str(sku_row).strip():
+                    return str(sku_row).strip()
+
+                stmt_prod = select(Product.sku).where(
+                    Product.ean == ean,
+                    Product.sku.isnot(None),
+                ).limit(1)
+                prod_sku = (await session.execute(stmt_prod)).scalar_one_or_none()
+                if prod_sku and str(prod_sku).strip():
+                    return str(prod_sku).strip()
+            except Exception as e:
+                logger.warning("DB lookup failed for EAN %s: %s", ean, e)
+
+        # 2. Try querying OTTO with sku=ean (in OTTO catalog, SKU often equals EAN)
+        try:
+            products_by_sku = await self.client.get_products(
+                GetProductRequest(sku=ean, page=0, limit=1),
+                controller,
+            )
+            variations = self._product_variations(products_by_sku)
+            for item in variations:
+                item_sku = str(item.get("sku") or item.get("SKU") or "").strip()
+                item_ean = str(item.get("ean") or item.get("EAN") or "").strip()
+                if item_sku == ean or item_ean == ean:
+                    return item_sku
+        except Exception as e:
+            logger.debug("OTTO lookup by sku=%s returned error: %s", ean, e)
+
+        # 3. Try querying OTTO with productReference=ean
+        try:
+            products_by_ref = await self.client.get_products(
+                GetProductRequest(productReference=ean, page=0, limit=10),
+                controller,
+            )
+            variations = self._product_variations(products_by_ref)
+            for item in variations:
+                item_sku = str(item.get("sku") or item.get("SKU") or "").strip()
+                item_ean = str(item.get("ean") or item.get("EAN") or "").strip()
+                if item_ean == ean and item_sku:
+                    return item_sku
+            if len(variations) == 1:
+                first_sku = str(variations[0].get("sku") or "").strip()
+                if first_sku:
+                    return first_sku
+        except Exception as e:
+            logger.debug("OTTO lookup by productReference=%s returned error: %s", ean, e)
+
+        return None
+
     async def set_active_status_by_ean(
         self,
         payload: ActiveStatusByEanRequest,
         active: bool,
+        session: AsyncSession | None = None,
     ):
         ean = payload.ean.strip()
         controller = payload.controller.value
-        products = await self.client.get_products(
-            GetProductRequest(ean=ean, page=0, limit=1),
-            controller,
-        )
-        sku = self._sku_for_ean(products, ean)
+
+        sku = await self.resolve_sku_for_ean(ean, controller, session=session)
         if not sku:
             return ActiveStatusByEanResponse(
                 success=False,
@@ -298,15 +529,52 @@ class ExternalService:
                 active=active,
                 controller=payload.controller,
                 status_code=404,
-                message="Product was not found by EAN",
-                response=products,
+                message=f"Product with EAN '{ean}' was not found on {controller.upper()}",
+                response=None,
             )
+
+        # If deactivating, OTTO requires setting quantity to 0 so the product is completely pulled from the marketplace
+        if not active:
+            try:
+                quantity_req = QuantityRequest(root=[Quantity(sku=sku, quantity=0)])
+                await self.client.update_quantity(quantity_req, controller)
+                logger.info(
+                    "Set quantity=0 before deactivation for SKU %s on %s",
+                    sku, controller.upper(),
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to set quantity=0 for SKU %s on %s: %s",
+                    sku, controller.upper(), e,
+                )
 
         status_code, response = await self.client.update_active_status(
             {"status": [{"sku": sku, "active": active}]},
             controller,
         )
         success = status_code == 202
+
+        # Update local DB if session is provided and request was accepted
+        if success and session is not None:
+            try:
+                new_status = "Aktiv" if active else "Inaktiv"
+                await session.execute(
+                    update(Product)
+                    .where(or_(Product.sku == sku, Product.ean == ean))
+                    .values(active_status=new_status, marketplace_status=new_status)
+                )
+                await session.execute(
+                    update(OttoXlsxImportRow)
+                    .where(
+                        OttoXlsxImportRow.account == controller.lower(),
+                        or_(OttoXlsxImportRow.sku == sku, OttoXlsxImportRow.ean == ean),
+                    )
+                    .values(active_status=new_status, marketplace_status=new_status)
+                )
+                await session.commit()
+            except Exception as e:
+                logger.warning("Failed to update status in DB for SKU %s: %s", sku, e)
+
         return ActiveStatusByEanResponse(
             success=success,
             ean=ean,
@@ -315,12 +583,24 @@ class ExternalService:
             controller=payload.controller,
             status_code=status_code,
             message=(
-                "Active status update was accepted by OTTO"
+                f"Active status update ({'activate' if active else 'deactivate'}) was accepted by OTTO"
                 if success
-                else "Active status update was rejected by OTTO"
+                else f"Active status update was rejected by OTTO (status {status_code})"
             ),
             response=response,
         )
+
+    async def get_quantity(
+        self,
+        sku_or_ean: str,
+        controller: str = "jv",
+        session: AsyncSession | None = None,
+    ) -> dict[str, Any]:
+        identifier = str(sku_or_ean or "").strip()
+        sku = await self.resolve_sku_for_ean(identifier, controller, session=session)
+        if not sku:
+            sku = identifier
+        return await self.client.get_quantity(sku, controller)
 
     async def get_shipping_profiles(
         self,
@@ -353,6 +633,10 @@ class ExternalService:
         seen_categories: set[str] = set()
         category_ids_by_name = {}
         for group in category_response.categoryGroups:
+            category_group_id = self._stable_int_id(
+                "category_group",
+                group.categoryGroup,
+            )
             for category in group.categories:
                 normalized = str(category or "").strip()
                 if normalized and normalized not in seen_categories:
@@ -362,6 +646,8 @@ class ExternalService:
                     ) or self._stable_int_id("category", normalized)
                     categories.append(
                         ExternalCategoryItem(
+                            category_group=group.categoryGroup,
+                            category_group_id=category_group_id,
                             categoryId=category_id,
                             name=normalized,
                         )
@@ -454,7 +740,11 @@ class ExternalService:
         page = max(0, int(payload.get("page") or 0))
         limit = max(0, int(payload.get("limit") or 10))
         category = str(payload.get("category") or "").strip()
-        stmt = select(Category).order_by(Category.name.asc())
+        stmt = (
+            select(Category)
+            .options(selectinload(Category.group))
+            .order_by(Category.name.asc())
+        )
         if category:
             stmt = stmt.where(Category.name.ilike(f"%{category}%"))
         if limit:
@@ -464,6 +754,8 @@ class ExternalService:
         return ExternalCategoriesResponse(
             categories=[
                 ExternalCategoryItem(
+                    category_group=item.group.name if item.group else None,
+                    category_group_id=item.group_id,
                     categoryId=item.id,
                     name=item.name,
                 )
@@ -573,7 +865,4 @@ class ExternalService:
             if sku and item_ean == ean:
                 return sku
 
-        first_sku = str(
-            variations[0].get("sku") or variations[0].get("SKU") or ""
-        ).strip()
-        return first_sku or None
+        return None

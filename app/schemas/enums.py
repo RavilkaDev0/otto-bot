@@ -28,6 +28,15 @@ class Controller(str, Enum):
     JV = "jv"
     XL = "xl"
 
+    @classmethod
+    def _missing_(cls, value: object):
+        if isinstance(value, str):
+            val_lower = value.lower()
+            for member in cls:
+                if member.value == val_lower or member.name.lower() == val_lower:
+                    return member
+        return None
+
 
 class ShippingProfileEnum(str, Enum):
     FOUR_TO_EIGHT_WEEKS = "786c6468-3baf-52e0-88b5-13757eb7f873"

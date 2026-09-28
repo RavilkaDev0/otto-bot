@@ -71,6 +71,10 @@ class AttributeSchema(BaseModel):
     unitDisplayName: Optional[str] = None
     allowedValues: list[Any] = []
 
+    @property
+    def id(self) -> Optional[int]:
+        return self.attributeId
+
 
 class CategoryGroupSchema(BaseModel):
     categoryGroup: str
@@ -86,8 +90,14 @@ class OttoCategoryResponse(BaseModel):
 
 
 class ExternalCategoryItem(BaseModel):
+    category_group: str | None = None
+    category_group_id: int | None = None
     categoryId: Optional[int] = None
     name: str
+
+    @property
+    def id(self) -> Optional[int]:
+        return self.categoryId
 
 
 class ExternalCategoriesResponse(BaseModel):

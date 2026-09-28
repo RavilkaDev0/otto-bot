@@ -155,8 +155,18 @@ def build_normalized_product(
     source: dict[str, Any],
     description_html: str | None = None,
     controller: Any = "jv",
+    delivery_time: int | None = None,
 ) -> dict[str, Any]:
-    """Build the minimal valid product payload used by the factory flow."""
+    """Build the minimal valid product payload used by the factory flow.
+
+    Args:
+        source: Raw Afterbuy product row.
+        description_html: Optional pre-rendered HTML description.
+        controller: OTTO account controller (jv / xl).
+        delivery_time: Override delivery time in days. When set, a ``delivery``
+            block is injected into the payload. The delivery *type* is preserved
+            from ``source`` if present, or left out so OTTO keeps its own value.
+    """
     specifics = _parse_specifics(source.get("CustomItemSpecifics"))
     ean = (
         _pick_text(
@@ -180,7 +190,7 @@ def build_normalized_product(
     description = description_html or _description(source, specifics)
     price = _parse_float(source.get("Startpreis"), 0.0)
 
-    return {
+    result: dict[str, Any] = {
         "productReference": ean,
         "sku": ean,
         "ean": ean or None,
@@ -201,6 +211,19 @@ def build_normalized_product(
         },
         "mediaAssets": _media_assets(source),
     }
+
+    if delivery_time is not None:
+        delivery_block: dict[str, Any] = {"deliveryTime": delivery_time}
+        # Preserve delivery type from source if already present; don't force a new type.
+        existing_type = _pick_text(
+            source.get("deliveryType"),
+            source.get("delivery_type"),
+        )
+        if existing_type:
+            delivery_block["type"] = existing_type
+        result["delivery"] = delivery_block
+
+    return result
 
 
 __all__ = ["brand_id_for_controller", "build_normalized_product"]

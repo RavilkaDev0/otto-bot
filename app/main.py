@@ -4,7 +4,9 @@ import os
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.staticfiles import StaticFiles
 
 from app.core.configs import settings
@@ -16,7 +18,7 @@ from app.api.routes.external_api import router as external_api_router
 from app.core.configs import settings
 from app.core.logger import logging
 from app.core.sentry import init_sentry
-from app.infrastructure.rabbitmq import RabbitMQPublisher
+from app.infrastructure.rabbitmq_publisher import RabbitMQPublisher
 
 logger = logging.getLogger(__name__)
 
@@ -41,8 +43,27 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await publisher.close()
+        try:
+            from app.dependencies import get_external_otto_client
+            await get_external_otto_client().close()
+        except Exception:
+            logger.exception("Error closing external OTTO client")
 
 app = FastAPI(title="FastAPI Template", lifespan=lifespan)
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(
+    request: Request,
+    exc: RequestValidationError,
+):
+    logger.warning(
+        "Request validation failed: method=%s path=%s errors=%s",
+        request.method,
+        request.url.path,
+        exc.errors(),
+    )
+    return await request_validation_exception_handler(request, exc)
 
 app.include_router(external_api_router)
 app.include_router(auth_router)
@@ -69,4 +90,3 @@ app.mount(
 async def health_check():
     """Simple liveness endpoint used by uptime checks and deployments."""
     return {"status": "ok"}
-

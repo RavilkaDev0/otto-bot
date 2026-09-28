@@ -238,6 +238,20 @@ class OttoClient:
             "GET", f"/v5/products/update-tasks/{pid}/failed", controller=controller
         )
 
+    async def succeeded_tasks(
+        self, pid: str, controller: Controller | str = Controller.JV
+    ):
+        return await self._request(
+            "GET", f"/v5/products/update-tasks/{pid}/succeeded", controller=controller
+        )
+
+    async def unchanged_tasks(
+        self, pid: str, controller: Controller | str = Controller.JV
+    ):
+        return await self._request(
+            "GET", f"/v5/products/update-tasks/{pid}/unchanged", controller=controller
+        )
+
     async def get_marketplace_status(
         self,
         payload: dict | None = None,

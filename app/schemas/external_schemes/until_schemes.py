@@ -2,7 +2,7 @@ from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, HttpUrl, RootModel
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, HttpUrl, RootModel, field_validator, model_validator
 
 from app.schemas.enums import Controller
 
@@ -10,8 +10,8 @@ from app.schemas.enums import Controller
 class GetProductRequest(BaseModel):
     sku: str | None = Field(
         default=None,
-        min_length=13,
-        max_length=13,
+        min_length=1,
+        max_length=50,
         title="SKU продукта(уникальное)",
         description="Уникальный идентификатор продукта. Если указан, возвращается 1 продукт",
         examples=["4003002005002"],
@@ -52,7 +52,7 @@ def to_camel(value: str) -> str:
 
 class OttoBaseModel(BaseModel):
     model_config = ConfigDict(
-        alias_generator=to_camel, populate_by_name=True, extra="forbid"
+        alias_generator=to_camel, populate_by_name=True, extra="ignore"
     )
 
 
@@ -87,7 +87,7 @@ class ProductDescriptionRequest(OttoBaseModel):
     )
     product_line: str | None = Field(
         default=None,
-        max_length=50,
+        max_length=100,
         description="Product line or product name",
         examples=["Kotak plus"],
     )
@@ -110,7 +110,7 @@ class ProductDescriptionRequest(OttoBaseModel):
         serialization_alias="fscCertified",
     )
     disposal: bool | None = None
-    product_url: HttpUrl | None = None
+    product_url: HttpUrl | None = Field(default=None, alias="productUrl")
     description: str | None = Field(
         default=None, description="Product description in German"
     )
@@ -142,8 +142,17 @@ MediaAssetType = Literal[
 
 class MediaAssetRequest(OttoBaseModel):
     type: MediaAssetType
-    location: HttpUrl = Field(description="Publicly accessible media URL")
-    filename: str | None = Field(default=None, min_length=1)
+    location: HttpUrl | None = Field(
+        default=None,
+        description="Publicly accessible media URL",
+    )
+    filename: str | None = None
+
+    @model_validator(mode="after")
+    def require_location_for_images(self):
+        if self.type == "IMAGE" and self.location is None:
+            raise ValueError("location is required for IMAGE media assets")
+        return self
 
 
 # ─────────────────────────────────────────────
@@ -160,7 +169,10 @@ DeliveryType = Literal[
 
 
 class DeliveryRequest(OttoBaseModel):
-    type: DeliveryType
+    type: DeliveryType = Field(
+        validation_alias=AliasChoices("type", "deliveryType"),
+        serialization_alias="type",
+    )
     delivery_time: int = Field(ge=1, description="Delivery time in days")
 
 
@@ -198,8 +210,17 @@ class PackingUnitRequest(OttoBaseModel):
 
 
 class LogisticsRequest(OttoBaseModel):
-    packaging_unit_count: int | None = Field(default=None, ge=1)
-    packaging_units: list[PackingUnitRequest] = Field(default_factory=list)
+    packing_unit_count: int | None = Field(default=None, alias="packingUnitCount")
+    packing_units: list[PackingUnitRequest] = Field(default_factory=list, alias="packingUnits")
+
+
+class MaxOrderQuantity(OttoBaseModel):
+    quantity: int | None = None
+    period_in_days: int | None = Field(default=None, alias="periodInDays")
+
+
+class Order(OttoBaseModel):
+    max_order_quantity: MaxOrderQuantity | None = Field(default=None, alias="maxOrderQuantity")
 
 
 # ─────────────────────────────────────────────
@@ -224,9 +245,32 @@ class ProductVariationRequest(OttoBaseModel):
         ),
         examples=["Usually SKU of the main product"],
     )
-    sku: str = Field(min_length=1, max_length=13, examples=["4021234231234"])
+    sku: str = Field(min_length=1, max_length=50, examples=["4021234231234"])
     ean: str = Field(min_length=8, max_length=13, examples=["4250123456789"])
-    shipping_profile_id: str
+    shipping_profile_id: str = Field(
+        validation_alias=AliasChoices(
+            "shippingProfileId",
+            "shippingProfileID",
+            "shipping_profile_id",
+        ),
+        serialization_alias="shippingProfileId",
+    )
+    quantity: int = Field(
+        default=20,
+        ge=0,
+        le=100000,
+        validation_alias=AliasChoices("quantity", "stock", "Stock"),
+        serialization_alias="quantity",
+        description="Stock quantity of product variation",
+    )
+
+    @field_validator("quantity", mode="before")
+    @classmethod
+    def default_quantity_if_none(cls, v: Any) -> int:
+        if v is None:
+            return 20
+        return v
+
     isbn: str | None = None
     upc: str | None = None
     pzn: str | None = None
@@ -234,7 +278,7 @@ class ProductVariationRequest(OttoBaseModel):
     moin: str | None = None
     offering_start_date: datetime | None = None
     release_date: datetime | None = None
-    max_order_quantity: int | None = Field(default=None, ge=1)
+    order: Order | None = None
     product_description: ProductDescriptionRequest
     media_assets: list[MediaAssetRequest] = Field(min_length=1)
     delivery: DeliveryRequest
@@ -273,8 +317,8 @@ class ActiveStatusByEanResponse(BaseModel):
 
 
 class Quantity(OttoBaseModel):
-    quantity: int = Field(ge=0, le=20, description="Quantity of a product", default=20)
-    sku: str = Field(min_length=1, max_length=13, examples=["4021234231234"])
+    quantity: int = Field(ge=0, le=100000, description="Quantity of a product", default=20)
+    sku: str = Field(min_length=1, max_length=50, examples=["4021234231234"])
 
 
 class QuantityRequest(RootModel[list[Quantity]]):
@@ -289,7 +333,7 @@ class DeliveryInformation(OttoBaseModel):
         description="The processing time of specific SKU which can be any value between 1 and 99",
         default="DEFAULT",
     )
-    sku: str = Field(min_length=1, max_length=13, examples=["4021234231234"])
+    sku: str = Field(min_length=1, max_length=50, examples=["4021234231234"])
 
 
 class DeliveryInformationRequest(RootModel[list[DeliveryInformation]]):
@@ -334,11 +378,27 @@ class ShippingProfileResponse(RootModel[list[ShippingProfile]]):
     root: list[ShippingProfile] = Field(
         max_length=300, description="Full list of shipping profiles"
     )
-    
-    
+
+
 class CreateDeliveryJob(OttoBaseModel):
     task_id: UUID = Field(default_factory=uuid4)
     marketplace_job_id: UUID = Field(description="OTTO job id. Used for status retrival")
     availability_data: AvailabilityRequest
     controller: Controller
-    
+
+
+class UpdateTaskResponse(OttoBaseModel):
+    state: str
+    message: str | None = None
+    total: int = 0
+    progress: int = 0
+    succeeded: int = 0
+    failed: int = 0
+    unchanged: int = 0
+
+    ping_after: datetime | None = Field(
+        default=None,
+        alias="pingAfter",
+    )
+
+    model_config = ConfigDict(extra="ignore")

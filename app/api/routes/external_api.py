@@ -12,12 +12,11 @@ from app.schemas.product_response import (
 )
 from app.dependencies import (
     get_external_api_service,
-    get_external_repository,
-    get_rabbitmq_publisher
+    get_rabbitmq_publisher,
 )
 from app.database import get_db
+from app.core.logger import format_log_payload
 from app.services.extermal_service import ExternalService
-from app.repository.external_api_repository import ExternalApiRepository
 from app.schemas.enums import Controller
 from app.infrastructure.rabbitmq_publisher import RabbitMQPublisher
 
@@ -37,8 +36,8 @@ router = APIRouter(prefix="/extermal", tags=["external"])
 async def get_products(
     sku: str | None = Query(
         default=None,
-        min_length=13,
-        max_length=13,
+        min_length=1,
+        max_length=50,
         description="Уникальный идентификатор продукта. Если указан, возвращается 1 продукт",
     ),
     product_reference: str | None = Query(
@@ -61,7 +60,7 @@ async def get_products(
     ),
     service: ExternalService = Depends(get_external_api_service),
 ):
-    logger.info("Эндпоинт extermal/get_product")
+    logger.info("Endpoint accepted: GET /extermal/get_products")
     payload = GetProductRequest(
         sku=sku,
         productReference=product_reference,
@@ -71,10 +70,10 @@ async def get_products(
         limit=limit,
     )
     
-    logger.info(f"get_product пэйлоад: {payload}")
+    logger.info("GET /extermal/get_products payload:\n%s", format_log_payload(payload))
     data = await service.get_products(payload, controller)
 
-    logger.info("Роутер возвращает данные")
+    logger.info("Endpoint completed: GET /extermal/get_products")
     
     return data
 
@@ -84,14 +83,15 @@ async def create_or_update_product(
     payload: Annotated[CreateOrUpdateProductVariationRequest, Body()],
     controller: Annotated[Controller, Query()] = Controller.JV,
     service: ExternalService = Depends(get_external_api_service),
-    repository: ExternalApiRepository = Depends(get_external_repository),
-    publisher: RabbitMQPublisher = Depends(get_rabbitmq_publisher)
+    publisher: RabbitMQPublisher = Depends(get_rabbitmq_publisher),
 ):
-    logger.info(f"Запрос был принят энпоинтом extermal/create_or_update_product.\n payload: {payload}")
+    logger.info("Endpoint accepted: POST /extermal/create_or_update_product")
+    logger.info(
+        "POST /extermal/create_or_update_product payload:\n%s",
+        format_log_payload(payload),
+    )
     data = await service.create_or_update_product(payload, controller, publisher)
-    
-    logger.info(f"Ответ от ОТТО: {data}")
-    
+    logger.info("Endpoint completed: POST /extermal/create_or_update_product")
     return data
 
 
@@ -99,7 +99,11 @@ async def create_or_update_product(
 async def activate_product_by_ean(
     payload: Annotated[ActiveStatusByEanRequest, Body()],
     service: ExternalService = Depends(get_external_api_service),
+    db: AsyncSession | None = Depends(get_db),
 ):
+    session = db if isinstance(db, AsyncSession) else None
+    if session is not None:
+        return await service.set_active_status_by_ean(payload, active=True, session=session)
     return await service.set_active_status_by_ean(payload, active=True)
 
 
@@ -107,7 +111,11 @@ async def activate_product_by_ean(
 async def deactivate_product_by_ean(
     payload: Annotated[ActiveStatusByEanRequest, Body()],
     service: ExternalService = Depends(get_external_api_service),
+    db: AsyncSession | None = Depends(get_db),
 ):
+    session = db if isinstance(db, AsyncSession) else None
+    if session is not None:
+        return await service.set_active_status_by_ean(payload, active=False, session=session)
     return await service.set_active_status_by_ean(payload, active=False)
 
 
@@ -145,3 +153,19 @@ async def get_category_attributes(
 ):
     data = await service.get_category_attributes(category_id, "jv", db)
     return data
+
+
+@router.get(
+    "/quantity/{sku}",
+    summary="Get actual product quantity from OTTO availability",
+    description="Fetches live stock quantity from OTTO for given SKU or EAN.",
+)
+async def get_quantity(
+    sku: str,
+    controller: Annotated[str, Query()] = "jv",
+    service: ExternalService = Depends(get_external_api_service),
+    db: AsyncSession | None = Depends(get_db),
+):
+    session = db if isinstance(db, AsyncSession) else None
+    return await service.get_quantity(sku_or_ean=sku, controller=controller, session=session)
+

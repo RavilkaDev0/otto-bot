@@ -1,3 +1,4 @@
+import json
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
@@ -18,6 +19,25 @@ MAX_LOG_SIZE = 10 * 1024 * 1024  # 10 MB
 BACKUP_COUNT = 5
 
 
+def format_log_payload(payload: object) -> str:
+    if hasattr(payload, "model_dump"):
+        payload = payload.model_dump(
+            mode="json",
+            by_alias=True,
+            exclude_none=True,
+        )
+
+    try:
+        return json.dumps(
+            payload,
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    except TypeError:
+        return str(payload)
+
+
 def create_file_handler(
     filename: Path,
     formatter: logging.Formatter,
@@ -34,6 +54,14 @@ def create_file_handler(
     return handler
 
 
+def create_console_handler(formatter: logging.Formatter) -> logging.StreamHandler:
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setLevel(LOG_LEVEL)
+    handler.setFormatter(formatter)
+
+    return handler
+
+
 def setup_logging() -> None:
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -43,9 +71,7 @@ def setup_logging() -> None:
     )
 
     # Вывод логов в терминал
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(LOG_LEVEL)
-    console_handler.setFormatter(formatter)
+    console_handler = create_console_handler(formatter)
 
     # Основной файл logs/otto_bot.log
     main_file_handler = create_file_handler(
@@ -70,6 +96,7 @@ def setup_logging() -> None:
     external_api_logger = logging.getLogger("external_api")
     external_api_logger.handlers.clear()
     external_api_logger.setLevel(LOG_LEVEL)
+    external_api_logger.addHandler(create_console_handler(formatter))
     external_api_logger.addHandler(external_api_handler)
     external_api_logger.propagate = False
 
