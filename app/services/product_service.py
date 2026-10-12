@@ -90,6 +90,12 @@ class ProductService:
     async def failed_tasks(self, pid: str, controller: Controller = Controller.JV):
         return await self.client.failed_tasks(pid, controller=controller)
 
+    async def succeeded_tasks(self, pid: str, controller: Controller = Controller.JV):
+        return await self.client.succeeded_tasks(pid, controller=controller)
+
+    async def unchanged_tasks(self, pid: str, controller: Controller = Controller.JV):
+        return await self.client.unchanged_tasks(pid, controller=controller)
+
     async def get_marketplace_status(
         self,
         payload: dict,

@@ -217,6 +217,39 @@ FACTORY_TASK_STATE_SERVICE = FactoryTaskStateService()
 PRODUCT_DEACTIVATE_CONCURRENCY = 10
 FACTORY_AI_ENRICHMENT_LOCKS: dict[str, asyncio.Lock] = {}
 
+# Delivery time (in calendar days) applied to all Turkish (TR) factory products.
+# 39 days ≈ 5.6 weeks → OTTO displays this as "lieferbar in 4-8 Wochen" / "8 Wochen".
+TR_FACTORY_DELIVERY_TIME_DAYS = 39
+
+
+def _is_tr_factory(factory_name: str | None) -> bool:
+    """Return True if the factory name ends with the _(TR) / _(Tr) suffix."""
+    name = (factory_name or "").replace(" ", "_").upper()
+    return "_(TR)" in name
+
+
+async def _resolve_factory_record(
+    factory_id: str,
+    account: str,
+) -> "Factories | None":
+    """Fetch the Factories DB row matching factory_id and account.
+
+    Returns ``None`` if the record is not found or the lookup fails.
+    """
+    try:
+        normalized_id = str(factory_id or "").strip()
+        normalized_account = str(account or "").strip().upper()
+        async with SessionLocal() as _db:
+            result = await _db.execute(
+                select(Factories).where(
+                    Factories.factory_id == normalized_id,
+                    func.upper(Factories.account) == normalized_account,
+                )
+            )
+            return result.scalar_one_or_none()
+    except Exception:
+        return None
+
 
 def _reset_log_file(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -982,6 +1015,15 @@ async def _build_factory_prepared_products(
         item.model_dump(mode="json", exclude_none=True) for item in source.products
     ]
 
+    # Resolve factory name to detect TR origin (delivery_time override).
+    _factory_db_record = await _resolve_factory_record(
+        factory_id=payload.factory_id,
+        account=payload.controller.value,
+    )
+    _factory_name_for_delivery: str | None = (
+        _factory_db_record.name if _factory_db_record is not None else None
+    )
+
     try:
         await _run_step_with_timeout(
             step_name="fetch_stammartikel_descriptions",
@@ -1032,12 +1074,19 @@ async def _build_factory_prepared_products(
             ean = source_item.get("EAN") or source_item.get("ean")
             MAPPER_LOGGER.info("step=normalize_start index=%s ean=%s", index, ean)
             async with normalize_semaphore:
+                # Determine delivery_time override: 39 days for all TR factories.
+                _delivery_time_override: int | None = (
+                    TR_FACTORY_DELIVERY_TIME_DAYS
+                    if _is_tr_factory(_factory_name_for_delivery)
+                    else None
+                )
                 normalized = await asyncio.wait_for(
                     asyncio.to_thread(
                         build_normalized_product,
                         source_item,
                         None,
                         payload.controller,
+                        _delivery_time_override,
                     ),
                     timeout=FACTORY_NORMALIZE_TIMEOUT_SEC,
                 )
@@ -2907,6 +2956,74 @@ async def get_otto_products_direct(
         **({"moin": moin} if moin else {}),
     }
     return await product_service.get_products(payload, controller=controller)
+
+
+@router.get(
+    "/otto/update-tasks/{process_id}",
+    summary="Fetch OTTO product update task status",
+)
+@otto_v5_router.get(
+    "/update-tasks/{process_id}",
+    summary="Fetch OTTO product update task status",
+)
+async def get_otto_product_update_task_status(
+    process_id: str,
+    controller: Controller = Query(default=Controller.JV),
+    product_service: ProductService = Depends(get_product_service),
+):
+    """Proxy OTTO `GET /v5/products/update-tasks/{processUuid}`."""
+    return await product_service.update_tasks(process_id, controller=controller)
+
+
+@router.get(
+    "/otto/update-tasks/{process_id}/failed",
+    summary="Fetch failed OTTO product update task rows",
+)
+@otto_v5_router.get(
+    "/update-tasks/{process_id}/failed",
+    summary="Fetch failed OTTO product update task rows",
+)
+async def get_otto_product_update_task_failed(
+    process_id: str,
+    controller: Controller = Query(default=Controller.JV),
+    product_service: ProductService = Depends(get_product_service),
+):
+    """Proxy OTTO `GET /v5/products/update-tasks/{processUuid}/failed`."""
+    return await product_service.failed_tasks(process_id, controller=controller)
+
+
+@router.get(
+    "/otto/update-tasks/{process_id}/succeeded",
+    summary="Fetch succeeded OTTO product update task rows",
+)
+@otto_v5_router.get(
+    "/update-tasks/{process_id}/succeeded",
+    summary="Fetch succeeded OTTO product update task rows",
+)
+async def get_otto_product_update_task_succeeded(
+    process_id: str,
+    controller: Controller = Query(default=Controller.JV),
+    product_service: ProductService = Depends(get_product_service),
+):
+    """Proxy OTTO `GET /v5/products/update-tasks/{processUuid}/succeeded`."""
+    return await product_service.succeeded_tasks(process_id, controller=controller)
+
+
+@router.get(
+    "/otto/update-tasks/{process_id}/unchanged",
+    summary="Fetch unchanged OTTO product update task rows",
+)
+@otto_v5_router.get(
+    "/update-tasks/{process_id}/unchanged",
+    summary="Fetch unchanged OTTO product update task rows",
+)
+async def get_otto_product_update_task_unchanged(
+    process_id: str,
+    controller: Controller = Query(default=Controller.JV),
+    product_service: ProductService = Depends(get_product_service),
+):
+    """Proxy OTTO `GET /v5/products/update-tasks/{processUuid}/unchanged`."""
+    return await product_service.unchanged_tasks(process_id, controller=controller)
 
 
 @router.get("/otto/shipping-profiles")
@@ -6237,4 +6354,73 @@ async def fetch_otto_categories_to_db(
         "success": True,
         "message": "OTTO category cache refreshed",
         **counts,
+    }
+
+
+@router.get("/marketplace_status")
+async def get_marketplace_status(
+    controller: Controller = Query(default=Controller.JV),
+    sku: str = Query(),
+    product_service: ProductService = Depends(get_product_service),
+):
+    """Fetch consolidated marketplace visibility and active status from OTTO."""
+    mp_task = product_service.get_marketplace_status({"sku": sku}, controller=controller)
+    act_task = product_service.get_active_products({"sku": sku}, controller=controller)
+
+    mp_res, act_res = await asyncio.gather(mp_task, act_task, return_exceptions=True)
+
+    marketplace_data = mp_res if isinstance(mp_res, dict) else {}
+    if isinstance(mp_res, Exception):
+        logger.warning("Failed to fetch marketplace_status for sku=%s: %s", sku, mp_res)
+
+    active_data = act_res if isinstance(act_res, dict) else {}
+    if isinstance(act_res, Exception):
+        logger.warning("Failed to fetch active_products for sku=%s: %s", sku, act_res)
+
+    marketplace_entries = (
+        marketplace_data.get("marketPlaceStatus", [])
+        if isinstance(marketplace_data, dict)
+        else []
+    )
+    mp_entry = marketplace_entries[0] if marketplace_entries else {}
+    mp_status = mp_entry.get("status")
+    moin = mp_entry.get("moin")
+
+    active_entries = (
+        active_data.get("status", [])
+        if isinstance(active_data, dict)
+        else []
+    )
+    act_entry = active_entries[0] if active_entries else {}
+    is_active_in_portal = act_entry.get("active")
+
+    found = bool(marketplace_entries or active_entries)
+    is_live = bool(is_active_in_portal is True and mp_status == "ONLINE")
+
+    if not found:
+        status_label = "NOT_FOUND"
+        message = f"Товар с SKU {sku} не найден на аккаунте {controller.value.upper()}"
+    elif not is_active_in_portal:
+        status_label = "INACTIVE_BY_SELLER"
+        message = "Товар выключен в кабинете продавца OTTO (Inaktiv). Покупатели его не видят."
+    elif mp_status != "ONLINE":
+        status_label = mp_status or "PENDING"
+        message = f"Товар активен в кабинете, но статус модерации OTTO: {status_label}"
+    else:
+        status_label = "ONLINE"
+        message = "Товар активен в кабинете и опубликован на витрине OTTO (Online)"
+
+    return {
+        "sku": sku,
+        "controller": controller.value,
+        "found": found,
+        "is_live": is_live,
+        "portal_active_status": is_active_in_portal,
+        "marketplace_status": mp_status if found else "NOT_FOUND",
+        "status_label": status_label,
+        "message": message,
+        "moin": moin,
+        "marketPlaceStatus": marketplace_entries,
+        "activeStatus": active_data,
+        "links": marketplace_data.get("links", []) if isinstance(marketplace_data, dict) else [],
     }

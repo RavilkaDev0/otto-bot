@@ -180,7 +180,9 @@ def test_external_deactivate_endpoint_forwards_ean_payload():
 
 def test_external_create_adds_backend_owned_account_fields():
     client = AsyncMock()
-    client.create_or_update_product.return_value = {"accepted": True}
+    client.create_or_update_product.return_value = {
+        "links": [{"href": "/v5/products/update-tasks/ec956c9d-4141-4c48-8df0-e04f4c20f188"}]
+    }
     service = ExternalService(client=client)
     payload = CreateOrUpdateProductVariationRequest.model_validate(
         [
@@ -188,6 +190,7 @@ def test_external_create_adds_backend_owned_account_fields():
                 "productReference": "4250123456789",
                 "sku": "4250123456789",
                 "ean": "4250123456789",
+                "shippingProfileId": "c5f87b2e-0a56-429f-a63e-324c0d1645e7",
                 "productDescription": {
                     "brandId": "WRONG_BRAND",
                     "category": "Sessel",
@@ -218,7 +221,9 @@ def test_external_create_adds_backend_owned_account_fields():
         service.create_or_update_product(payload=payload, controller="xl")
     )
 
-    assert response == {"accepted": True}
+    assert response["status"] == "accepted"
+    assert response["marketplace_job_id"] == "ec956c9d-4141-4c48-8df0-e04f4c20f188"
+    assert response["skus"] == ["4250123456789"]
     prepared_payload = client.create_or_update_product.await_args.args[0]
     assert (
         prepared_payload[0]["productDescription"]["brandId"]
@@ -243,6 +248,7 @@ def test_external_create_accepts_standard_otto_description_fields():
                 "productReference": "4250123456789",
                 "sku": "4250123456789",
                 "ean": "4250123456789",
+                "shippingProfileId": "c5f87b2e-0a56-429f-a63e-324c0d1645e7",
                 "productDescription": {
                     "brandId": "WRONG_BRAND",
                     "bundle": False,
