@@ -328,7 +328,7 @@ class ExternalOttoClient:
             duration_ms = (time.monotonic() - start_time) * 1000
 
             if (
-                idempotent
+                (idempotent or response.status_code == 429)
                 and response.status_code in RETRYABLE_STATUS_CODES
                 and attempt < max_attempts
             ):
@@ -489,7 +489,7 @@ class ExternalOttoClient:
         )
         return self._parse_response(response)
 
-    async def read_update_task_result(self, job_id: UUID, controller: str):
+    async def read_update_task_result(self, job_id: UUID | str, controller: Controller | str):
         response = await self._request(
             "GET",
             f"/v5/products/update-tasks/{job_id}",
@@ -497,3 +497,34 @@ class ExternalOttoClient:
             idempotent=True,
         )
         return self._parse_response(response)
+
+    async def get_update_task_failed(
+        self, job_id: UUID | str, controller: Controller | str
+    ) -> dict[str, Any] | None:
+        """Fetch failed items and error details from OTTO for a given update task."""
+        response = await self._request(
+            "GET",
+            f"/v5/products/update-tasks/{job_id}/failed",
+            controller,
+            idempotent=True,
+            raise_for_status=False,
+        )
+        if response.status_code == 200:
+            return self._parse_response(response)
+        return None
+
+    async def get_update_task_succeeded(
+        self, job_id: UUID | str, controller: Controller | str
+    ) -> dict[str, Any] | None:
+        """Fetch succeeded items from OTTO for a given update task."""
+        response = await self._request(
+            "GET",
+            f"/v5/products/update-tasks/{job_id}/succeeded",
+            controller,
+            idempotent=True,
+            raise_for_status=False,
+        )
+        if response.status_code == 200:
+            return self._parse_response(response)
+        return None
+

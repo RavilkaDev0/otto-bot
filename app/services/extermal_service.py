@@ -8,7 +8,11 @@ from httpx import HTTPStatusError
 from pydantic import ValidationError
 from datetime import datetime, timezone
 
-from app.core.otto_exceptions import OttoApiException, OttoNotFoundError
+from app.core.otto_exceptions import (
+    OttoApiException,
+    OttoNotFoundError,
+    OttoRateLimitError,
+)
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.orm import selectinload
@@ -155,9 +159,12 @@ class ExternalService:
         payload: CreateOrUpdateProductVariationRequest,
         controller: Controller,
         publisher: RabbitMQPublisher | None = None,
+        wait_for_completion: bool = False,
+        wait_timeout: float = 15.0,
     ):
         logger.info(
-            "Service accepted create_or_update_product request\npayload:\n%s",
+            "Service accepted create_or_update_product request (wait=%s)\npayload:\n%s",
+            wait_for_completion,
             format_log_payload(payload),
         )
 
@@ -170,6 +177,14 @@ class ExternalService:
 
         try:
             response = await self.client.create_or_update_product(prepared_payload, controller)
+        except OttoRateLimitError as exc:
+            logger.warning(
+                "OTTO rate limit при создании/обновлении товаров: skus=%s controller=%s retry_after=%s",
+                skus,
+                controller,
+                exc.retry_after,
+            )
+            raise
         except Exception:
             logger.exception("Ошибка создания или обновления товаров: skus=%s", skus)
             raise
@@ -208,11 +223,55 @@ class ExternalService:
                 skus,
             )
 
+        controller_name = controller.value if hasattr(controller, "value") else str(controller)
+
+        if wait_for_completion:
+            try:
+                interval = 2.0
+                max_attempts = max(1, int(wait_timeout / interval))
+                task_res = await self._wait_for_update_task(
+                    marketplace_job_id,
+                    controller_name,
+                    max_attempts=max_attempts,
+                    interval_seconds=interval,
+                )
+                status_dict = await self.get_job_status(marketplace_job_id, controller)
+                is_done = task_res.state.lower() in ("done", "finished")
+                return {
+                    "status": "done" if is_done else "in_progress",
+                    "job_id": str(marketplace_job_id),
+                    "marketplace_job_id": str(marketplace_job_id),
+                    "task_id": str(job.task_id),
+                    "skus": skus,
+                    "controller": controller_name,
+                    "state": task_res.state,
+                    "total": status_dict.get("total", 0),
+                    "succeeded": status_dict.get("succeeded", 0),
+                    "failed": status_dict.get("failed", 0),
+                    "unchanged": status_dict.get("unchanged", 0),
+                    "failures": status_dict.get("failures", []),
+                    "message": (
+                        "Products processed by OTTO"
+                        if is_done
+                        else "Product processing in progress"
+                    ),
+                    "raw_response": response,
+                }
+            except Exception as e:
+                logger.warning(
+                    "Timed out or error waiting for OTTO job status (returning accepted): job_id=%s error=%s",
+                    marketplace_job_id,
+                    e,
+                )
+
         return {
             "status": "accepted",
+            "job_id": str(marketplace_job_id),
             "marketplace_job_id": str(marketplace_job_id),
             "task_id": str(job.task_id),
             "skus": skus,
+            "controller": controller_name,
+            "message": "Product variations accepted by OTTO. Use GET /extermal/job_status/{job_id} to track processing status.",
             "raw_response": response,
         }
 
@@ -351,8 +410,9 @@ class ExternalService:
         )
 
 
-    async def read_update_task_result(self, job_id: UUID, controller) -> UpdateTaskResponse:
-        response = await self.client.read_update_task_result(job_id, controller)
+    async def read_update_task_result(self, job_id: UUID | str, controller: Controller | str) -> UpdateTaskResponse:
+        controller_name = controller.value if hasattr(controller, "value") else str(controller)
+        response = await self.client.read_update_task_result(job_id, controller_name)
 
         try:
             data = UpdateTaskResponse.model_validate(response)
@@ -366,6 +426,52 @@ class ExternalService:
             raise
 
         return data
+
+    async def get_job_status(
+        self, job_id: UUID | str, controller: Controller | str
+    ) -> dict[str, Any]:
+        """Fetch real-time status of an OTTO update task, including failure details if any."""
+        controller_name = controller.value if hasattr(controller, "value") else str(controller)
+        task_data = await self.client.read_update_task_result(job_id, controller_name)
+
+        if hasattr(task_data, "model_dump"):
+            task_dict = task_data.model_dump()
+        elif isinstance(task_data, dict):
+            task_dict = task_data
+        else:
+            task_dict = {}
+
+        state = task_dict.get("state", "UNKNOWN")
+        total = task_dict.get("total", 0)
+        progress = task_dict.get("progress", 0)
+        succeeded = task_dict.get("succeeded", 0)
+        failed = task_dict.get("failed", 0)
+        unchanged = task_dict.get("unchanged", 0)
+
+        result: dict[str, Any] = {
+            "job_id": str(job_id),
+            "controller": controller_name,
+            "state": state,
+            "total": total,
+            "progress": progress,
+            "succeeded": succeeded,
+            "failed": failed,
+            "unchanged": unchanged,
+            "failures": [],
+            "succeeded_items": [],
+        }
+
+        if failed > 0:
+            failed_resp = await self.client.get_update_task_failed(job_id, controller_name)
+            if failed_resp:
+                result["failures"] = failed_resp.get("results", failed_resp)
+
+        if succeeded > 0:
+            succ_resp = await self.client.get_update_task_succeeded(job_id, controller_name)
+            if succ_resp:
+                result["succeeded_items"] = succ_resp.get("results", succ_resp)
+
+        return result
 
 
     async def _wait_for_update_task(
@@ -389,7 +495,7 @@ class ExternalService:
                     continue
                 raise
 
-            if update_status.state == "done":
+            if update_status.state.lower() in ("done", "finished"):
                 logger.info(
                     "Статус задачи получен: job_id=%s attempt=%d",
                     job_id,
@@ -397,7 +503,7 @@ class ExternalService:
                 )
                 return update_status
 
-            if update_status.state in ("failed", "error", "cancelled"):
+            if update_status.state.lower() in ("failed", "error", "cancelled"):
                 logger.error(
                     "Задача OTTO завершилась со статусом %s: job_id=%s message=%s",
                     update_status.state,

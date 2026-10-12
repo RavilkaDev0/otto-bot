@@ -183,6 +183,19 @@ class OttoClient:
         """GET a single product by SKU without raising, returning status and body."""
         return await self._request_with_status("GET", f"/v5/products/{sku}")
 
+    async def get_product_with_headers(
+        self,
+        sku: str,
+        controller: Controller | str = Controller.JV,
+    ) -> tuple[int, Any, httpx.Headers]:
+        """GET a single product by SKU and return status_code, parsed_body, headers."""
+        response = await self._send(
+            "GET",
+            f"/v5/products/{sku}",
+            controller=controller,
+        )
+        return response.status_code, self._parse_response(response), response.headers
+
     async def get_products(
         self,
         payload: dict | None = None,
@@ -209,6 +222,20 @@ class OttoClient:
             params=payload,
             controller=controller,
         )
+
+    async def get_products_raw_with_headers(
+        self,
+        payload: dict | None = None,
+        controller: Controller | str = Controller.JV,
+    ) -> tuple[int, Any, httpx.Headers]:
+        """GET paginated products list returning status, body, and headers for rate limit handling."""
+        response = await self._send(
+            "GET",
+            "/v5/products",
+            params=payload,
+            controller=controller,
+        )
+        return response.status_code, self._parse_response(response), response.headers
 
     async def get_active_products(
         self,
@@ -354,6 +381,20 @@ class OttoClient:
         )
 
         return parse(ProductCreateResponse, response_data)
+
+    async def post_products_raw(
+        self,
+        products: list[dict[str, Any]],
+        controller: Controller | str = Controller.JV,
+    ) -> tuple[int, Any, httpx.Headers]:
+        """POST raw product variations list to /v5/products and return (status_code, parsed_body, headers)."""
+        response = await self._send(
+            "POST",
+            "/v5/products",
+            json=products,
+            controller=controller,
+        )
+        return response.status_code, self._parse_response(response), response.headers
 
     async def get_categories(
         self,

@@ -41,17 +41,19 @@ def format_log_payload(payload: object) -> str:
 def create_file_handler(
     filename: Path,
     formatter: logging.Formatter,
-) -> RotatingFileHandler:
-    handler = RotatingFileHandler(
-        filename=filename,
-        maxBytes=MAX_LOG_SIZE,
-        backupCount=BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    handler.setLevel(LOG_LEVEL)
-    handler.setFormatter(formatter)
-
-    return handler
+) -> logging.Handler:
+    try:
+        handler = RotatingFileHandler(
+            filename=filename,
+            maxBytes=MAX_LOG_SIZE,
+            backupCount=BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        handler.setLevel(LOG_LEVEL)
+        handler.setFormatter(formatter)
+        return handler
+    except (PermissionError, OSError):
+        return logging.NullHandler()
 
 
 def create_console_handler(formatter: logging.Formatter) -> logging.StreamHandler:

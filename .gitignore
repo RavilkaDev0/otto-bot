@@ -1,8 +1,19 @@
 .venv/
 __pycache__/
 *.pyc
-.env
 venv
 logs
 temp/
+archive/
+scratch/
+backups/
+*.log
+
+# Environment secrets
+.env
 docker.env
+
+# Local guarantee cleaner services
+app/services/otto_guarantee_*
+tests/test_guarantee_*
+scripts/otto_guarantee_*

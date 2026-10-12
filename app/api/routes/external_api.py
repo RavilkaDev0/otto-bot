@@ -2,6 +2,8 @@ from app.schemas.external_schemes.until_schemes import (
     ActiveStatusByEanRequest,
     ActiveStatusByEanResponse,
     CreateOrUpdateProductVariationRequest,
+    CreateOrUpdateProductResponse,
+    JobStatusResponse,
     GetProductRequest,
     ShippingProfileResponse,
 )
@@ -78,20 +80,47 @@ async def get_products(
     return data
 
 
-@router.post("/create_or_update_product")
+@router.post(
+    "/create_or_update_product",
+    response_model=CreateOrUpdateProductResponse,
+    summary="Create or update product variations in OTTO",
+    description="Submits product variations to OTTO. Returns job_id for asynchronous status tracking.",
+)
 async def create_or_update_product(
     payload: Annotated[CreateOrUpdateProductVariationRequest, Body()],
-    controller: Annotated[Controller, Query()] = Controller.JV,
+    controller: Annotated[Controller, Query(description="OTTO account (jv or xl)")] = Controller.JV,
+    wait_for_completion: Annotated[bool, Query(description="Wait for OTTO processing completion")] = False,
     service: ExternalService = Depends(get_external_api_service),
     publisher: RabbitMQPublisher = Depends(get_rabbitmq_publisher),
 ):
-    logger.info("Endpoint accepted: POST /extermal/create_or_update_product")
+    logger.info("Endpoint accepted: POST /extermal/create_or_update_product (wait=%s)", wait_for_completion)
     logger.info(
         "POST /extermal/create_or_update_product payload:\n%s",
         format_log_payload(payload),
     )
-    data = await service.create_or_update_product(payload, controller, publisher)
+    data = await service.create_or_update_product(
+        payload, controller, publisher, wait_for_completion=wait_for_completion
+    )
     logger.info("Endpoint completed: POST /extermal/create_or_update_product")
+    return data
+
+
+@router.get(
+    "/job_status/{job_id}",
+    response_model=JobStatusResponse,
+    summary="Get OTTO product upload job status",
+    description="Fetches live processing status of a product upload task from OTTO by job_id, including failure details if any.",
+)
+@router.get("/job/{job_id}", response_model=JobStatusResponse, include_in_schema=False)
+@router.get("/task_status/{job_id}", response_model=JobStatusResponse, include_in_schema=False)
+async def get_job_status(
+    job_id: str,
+    controller: Annotated[Controller, Query(description="OTTO account (jv or xl)")] = Controller.JV,
+    service: ExternalService = Depends(get_external_api_service),
+):
+    logger.info("Endpoint accepted: GET /extermal/job_status/%s controller=%s", job_id, controller)
+    data = await service.get_job_status(job_id, controller)
+    logger.info("Endpoint completed: GET /extermal/job_status/%s status=%s", job_id, data.get("state"))
     return data
 
 

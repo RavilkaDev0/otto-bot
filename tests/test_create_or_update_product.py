@@ -3,6 +3,11 @@ from uuid import UUID
 from unittest.mock import AsyncMock, MagicMock
 from pydantic import ValidationError
 from app.services.extermal_service import ExternalService
+import httpx
+from httpx import ASGITransport, AsyncClient
+from app.main import app
+from app.dependencies import get_external_api_service, get_rabbitmq_publisher
+from app.core.otto_exceptions import OttoRateLimitError, OttoApiException
 from app.schemas.external_schemes.until_schemes import (
     CreateOrUpdateProductVariationRequest,
     Controller,
@@ -73,6 +78,7 @@ async def test_create_or_update_product_multiple_variations():
     )
 
     assert result["status"] == "accepted"
+    assert result["job_id"] == "ec956c9d-4141-4c48-8df0-e04f4c20f188"
     assert result["marketplace_job_id"] == "ec956c9d-4141-4c48-8df0-e04f4c20f188"
     assert result["skus"] == ["SKU-1", "SKU-2"]
 
@@ -288,5 +294,232 @@ async def test_create_or_update_availability_aborts_when_failed():
 
     mock_client.update_quantity.assert_not_awaited()
     mock_client.update_product_delivery.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_create_or_update_product_otto_rate_limit_error_bubbles_up():
+    """Verify ExternalService logs warning and re-raises OttoRateLimitError."""
+    mock_client = MagicMock()
+    req = httpx.Request("POST", "https://api.otto.market/v5/products")
+    resp = httpx.Response(429, headers={"retry-after": "3"}, request=req)
+    mock_client.create_or_update_product = AsyncMock(
+        side_effect=OttoRateLimitError(
+            "rate limit",
+            request=req,
+            response=resp,
+            endpoint="/v5/products",
+            controller="jv",
+            retry_after=3.0,
+        )
+    )
+    service = ExternalService(client=mock_client)
+    payload = CreateOrUpdateProductVariationRequest.model_validate(
+        [_sample_variation("SKU-1", "407148900001", "sp-1")]
+    )
+
+    with pytest.raises(OttoRateLimitError) as exc_info:
+        await service.create_or_update_product(
+            payload=payload,
+            controller=Controller.JV,
+            publisher=MagicMock(),
+        )
+
+    assert exc_info.value.status_code == 429
+    assert exc_info.value.retry_after == 3.0
+
+
+@pytest.mark.asyncio
+async def test_create_or_update_product_endpoint_returns_429_on_rate_limit():
+    """Verify that when OttoRateLimitError is raised, the endpoint returns HTTP 429 with Retry-After header."""
+    mock_service = MagicMock()
+    req = httpx.Request("POST", "https://api.otto.market/v5/products")
+    resp = httpx.Response(429, headers={"retry-after": "4"}, request=req)
+    mock_service.create_or_update_product = AsyncMock(
+        side_effect=OttoRateLimitError(
+            "rate limit",
+            request=req,
+            response=resp,
+            endpoint="/v5/products",
+            controller="jv",
+            retry_after=4.0,
+        )
+    )
+
+    app.dependency_overrides[get_external_api_service] = lambda: mock_service
+    app.dependency_overrides[get_rabbitmq_publisher] = lambda: MagicMock()
+
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/extermal/create_or_update_product",
+                params={"controller": "jv"},
+                json=[_sample_variation("SKU-1", "407148900001", "sp-1")],
+            )
+
+            assert response.status_code == 429
+            assert response.headers.get("retry-after") == "4"
+            data = response.json()
+            assert data["error"] == "rate_limit_exceeded"
+            assert "OTTO API rate limit exceeded" in data["detail"]
+            assert data["retry_after"] == 4.0
+            assert data["controller"] == "jv"
+    finally:
+        app.dependency_overrides.pop(get_external_api_service, None)
+        app.dependency_overrides.pop(get_rabbitmq_publisher, None)
+
+
+@pytest.mark.asyncio
+async def test_create_or_update_product_endpoint_returns_upstream_status_on_otto_api_exception():
+    """Verify that when generic OttoApiException (e.g. 400 Bad Request) is raised, it returns appropriate status code."""
+    mock_service = MagicMock()
+    req = httpx.Request("POST", "https://api.otto.market/v5/products")
+    resp = httpx.Response(400, request=req)
+    mock_service.create_or_update_product = AsyncMock(
+        side_effect=OttoApiException(
+            "OTTO API request failed: POST /v5/products controller=jv status=400",
+            request=req,
+            response=resp,
+            endpoint="/v5/products",
+            controller="jv",
+        )
+    )
+
+    app.dependency_overrides[get_external_api_service] = lambda: mock_service
+    app.dependency_overrides[get_rabbitmq_publisher] = lambda: MagicMock()
+
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/extermal/create_or_update_product",
+                params={"controller": "jv"},
+                json=[_sample_variation("SKU-1", "407148900001", "sp-1")],
+            )
+
+            assert response.status_code == 400
+            data = response.json()
+            assert "OTTO API error" in data["detail"]
+            assert data["otto_status_code"] == 400
+            assert data["controller"] == "jv"
+    finally:
+        app.dependency_overrides.pop(get_external_api_service, None)
+        app.dependency_overrides.pop(get_rabbitmq_publisher, None)
+
+
+@pytest.mark.asyncio
+async def test_create_or_update_product_response_contains_job_id():
+    """Verify endpoint POST /extermal/create_or_update_product returns job_id."""
+    mock_service = MagicMock()
+    mock_service.create_or_update_product = AsyncMock(
+        return_value={
+            "status": "accepted",
+            "job_id": "ec956c9d-4141-4c48-8df0-e04f4c20f188",
+            "marketplace_job_id": "ec956c9d-4141-4c48-8df0-e04f4c20f188",
+            "task_id": "70d24e9f-93d5-45ec-8fcf-6d9b4db99480",
+            "skus": ["SKU-1"],
+            "controller": "jv",
+            "message": "Product variations accepted by OTTO. Use GET /extermal/job_status/{job_id} to track processing status.",
+        }
+    )
+
+    app.dependency_overrides[get_external_api_service] = lambda: mock_service
+    app.dependency_overrides[get_rabbitmq_publisher] = lambda: MagicMock()
+
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(
+                "/extermal/create_or_update_product",
+                params={"controller": "jv"},
+                json=[_sample_variation("SKU-1", "407148900001", "sp-1")],
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "accepted"
+            assert data["job_id"] == "ec956c9d-4141-4c48-8df0-e04f4c20f188"
+            assert data["marketplace_job_id"] == "ec956c9d-4141-4c48-8df0-e04f4c20f188"
+            assert data["skus"] == ["SKU-1"]
+            assert data["controller"] == "jv"
+            assert "job_status" in data["message"]
+    finally:
+        app.dependency_overrides.pop(get_external_api_service, None)
+        app.dependency_overrides.pop(get_rabbitmq_publisher, None)
+
+
+@pytest.mark.asyncio
+async def test_get_job_status_service():
+    """Verify get_job_status queries OTTO and returns progress with failures."""
+    mock_client = MagicMock()
+    mock_client.read_update_task_result = AsyncMock(
+        return_value={
+            "state": "DONE",
+            "total": 2,
+            "progress": 2,
+            "succeeded": 1,
+            "failed": 1,
+            "unchanged": 0,
+        }
+    )
+    mock_client.get_update_task_failed = AsyncMock(
+        return_value={"results": [{"sku": "SKU-FAIL", "errors": ["Invalid color"]}]}
+    )
+    mock_client.get_update_task_succeeded = AsyncMock(
+        return_value={"results": [{"sku": "SKU-OK"}]}
+    )
+
+    service = ExternalService(client=mock_client)
+    res = await service.get_job_status("ec956c9d-4141-4c48-8df0-e04f4c20f188", Controller.JV)
+
+    assert res["job_id"] == "ec956c9d-4141-4c48-8df0-e04f4c20f188"
+    assert res["state"] == "DONE"
+    assert res["succeeded"] == 1
+    assert res["failed"] == 1
+    assert len(res["failures"]) == 1
+    assert res["failures"][0]["sku"] == "SKU-FAIL"
+    assert len(res["succeeded_items"]) == 1
+
+
+@pytest.mark.asyncio
+async def test_get_job_status_endpoint():
+    """Verify endpoint GET /extermal/job_status/{job_id} works."""
+    mock_service = MagicMock()
+    mock_service.get_job_status = AsyncMock(
+        return_value={
+            "job_id": "ec956c9d-4141-4c48-8df0-e04f4c20f188",
+            "controller": "jv",
+            "state": "DONE",
+            "total": 1,
+            "progress": 1,
+            "succeeded": 1,
+            "failed": 0,
+            "unchanged": 0,
+            "failures": [],
+            "succeeded_items": [],
+        }
+    )
+
+    app.dependency_overrides[get_external_api_service] = lambda: mock_service
+
+    try:
+        transport = ASGITransport(app=app)
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get(
+                "/extermal/job_status/ec956c9d-4141-4c48-8df0-e04f4c20f188",
+                params={"controller": "jv"},
+            )
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["job_id"] == "ec956c9d-4141-4c48-8df0-e04f4c20f188"
+            assert data["state"] == "DONE"
+            assert data["succeeded"] == 1
+            assert data["failed"] == 0
+    finally:
+        app.dependency_overrides.pop(get_external_api_service, None)
+
+
+
 
 

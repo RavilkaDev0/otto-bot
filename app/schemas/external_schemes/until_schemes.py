@@ -402,3 +402,38 @@ class UpdateTaskResponse(OttoBaseModel):
     )
 
     model_config = ConfigDict(extra="ignore")
+
+
+class CreateOrUpdateProductResponse(BaseModel):
+    status: str = Field(description="Статус приёма: accepted или done")
+    job_id: str = Field(description="ID задачи OTTO (UUID update-task)")
+    marketplace_job_id: str = Field(description="Алиас для job_id (обратная совместимость)")
+    task_id: str = Field(description="Внутренний ID задачи очереди (RabbitMQ)")
+    skus: list[str] = Field(description="Список SKU товаров")
+    controller: str = Field(description="Аккаунт OTTO (jv или xl)")
+    message: str | None = Field(default=None, description="Пояснение статуса")
+    state: str | None = Field(default=None, description="Текущее состояние в OTTO (если запрошено wait_for_completion)")
+    total: int | None = Field(default=None, description="Всего товаров в задаче")
+    succeeded: int | None = Field(default=None, description="Успешно обработано товаров")
+    failed: int | None = Field(default=None, description="Упало с ошибкой")
+    unchanged: int | None = Field(default=None, description="Без изменений")
+    failures: list[Any] | None = Field(default=None, description="Ошибки OTTO при failed > 0")
+    raw_response: dict[str, Any] | None = Field(default=None, description="Сырой ответ OTTO")
+
+    model_config = ConfigDict(extra="ignore")
+
+
+class JobStatusResponse(BaseModel):
+    job_id: str = Field(description="ID задачи OTTO")
+    controller: str = Field(description="Аккаунт OTTO (jv или xl)")
+    state: str = Field(description="Состояние: PENDING, IN_PROGRESS, DONE, FINISHED, FAILED")
+    total: int = Field(default=0, description="Всего товаров в задаче")
+    progress: int = Field(default=0, description="Обработано товаров")
+    succeeded: int = Field(default=0, description="Успешно обработано")
+    failed: int = Field(default=0, description="С ошибками")
+    unchanged: int = Field(default=0, description="Без изменений")
+    failures: list[Any] = Field(default_factory=list, description="Список ошибок при failed > 0")
+    succeeded_items: list[Any] = Field(default_factory=list, description="Список успешных товаров при succeeded > 0")
+
+    model_config = ConfigDict(extra="ignore")
+
